@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InstrumentSync", "InstrumentSync.csproj", "{01E5EB80-275B-4C88-AAF0-7C9FFC7CE32C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InstrumentSync.Tests", "InstrumentSync.Tests\InstrumentSync.Tests.csproj", "{02809E35-8B32-4960-98D0-CA902A4D23EF}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MockApi", "MockApi\MockApi.csproj", "{6F5EE913-4CE1-4F90-938E-D938E16838D6}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{01E5EB80-275B-4C88-AAF0-7C9FFC7CE32C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{01E5EB80-275B-4C88-AAF0-7C9FFC7CE32C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{01E5EB80-275B-4C88-AAF0-7C9FFC7CE32C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{01E5EB80-275B-4C88-AAF0-7C9FFC7CE32C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{02809E35-8B32-4960-98D0-CA902A4D23EF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{02809E35-8B32-4960-98D0-CA902A4D23EF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{02809E35-8B32-4960-98D0-CA902A4D23EF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{02809E35-8B32-4960-98D0-CA902A4D23EF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6F5EE913-4CE1-4F90-938E-D938E16838D6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6F5EE913-4CE1-4F90-938E-D938E16838D6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6F5EE913-4CE1-4F90-938E-D938E16838D6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6F5EE913-4CE1-4F90-938E-D938E16838D6}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
