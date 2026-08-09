@@ -1,12 +1,14 @@
 <#
 Pages through a cursor-based POST API on an air-gapped network and persists
-each returned JSON object into SQL Server, tagged with the cursor GUID it
-came from. Built against System.Data.SqlClient (ships with .NET Framework)
-and Invoke-RestMethod (built into Windows PowerShell 5.1) so it needs no
-module installs.
+each returned JSON object into SQL Server, tagged with the cursor token it
+came from. The cursor is treated as an opaque string, not necessarily a GUID.
+Built against System.Data.SqlClient (ships with .NET Framework) and
+Invoke-RestMethod (built into Windows PowerShell 5.1) so it needs no module
+installs.
 
-Tune -CursorRequestField / -CursorResponseField / -DataField to match the
-real API's JSON property names once you've seen a live response.
+-CursorResponseField / -DataField accept dot-paths into the response body
+(e.g. 'meta.cursor', 'data.hits') to reach nested JSON properties. Tune these
+and -CursorRequestField to match the real API once you've seen a live response.
 #>
 
 [CmdletBinding()]
@@ -20,10 +22,12 @@ param(
     [string] $SqlServerInstance = 'localhost',
     [string] $SqlDatabase = 'ApiIngest',
 
-    # JSON property names in the API's request/response bodies.
+    # JSON property name to send the cursor under in the outgoing request body.
     [string] $CursorRequestField = 'cursor',
-    [string] $CursorResponseField = 'cursor',
-    [string] $DataField = 'items',
+
+    # Dot-paths into the response body, e.g. 'meta.cursor' for { "meta": { "cursor": ... } }.
+    [string] $CursorResponseField = 'meta.cursor',
+    [string] $DataField = 'data.hits',
 
     # Extra fixed fields to send on every request (filters, page size, etc).
     [hashtable] $BaseRequestBody = @{},
@@ -108,6 +112,19 @@ function Invoke-ApiPage {
     }
 }
 
+function Resolve-JsonPath {
+    param(
+        $InputObject,
+        [string] $Path
+    )
+    $current = $InputObject
+    foreach ($segment in $Path -split '\.') {
+        if ($null -eq $current) { return $null }
+        $current = $current.$segment
+    }
+    return $current
+}
+
 function New-SqlConnection {
     $connStr = "Server=$SqlServerInstance;Database=$SqlDatabase;Integrated Security=True;TrustServerCertificate=True;"
     $conn = New-Object System.Data.SqlClient.SqlConnection $connStr
@@ -119,8 +136,8 @@ function Save-ApiBatch {
     param(
         [System.Data.SqlClient.SqlConnection] $Connection,
         [guid] $BatchId,
-        [Nullable[guid]] $RequestCursor,
-        [Nullable[guid]] $ResponseCursor,
+        [string] $RequestCursor,
+        [string] $ResponseCursor,
         [object[]] $Items
     )
 
@@ -129,12 +146,12 @@ function Save-ApiBatch {
         $cmd = $Connection.CreateCommand()
         $cmd.Transaction = $tx
         $cmd.CommandText = @'
-INSERT INTO dbo.ApiCursorResults (BatchId, RequestCursorGuid, ResponseCursorGuid, ItemJson)
+INSERT INTO dbo.ApiCursorResults (BatchId, RequestCursor, ResponseCursor, ItemJson)
 VALUES (@BatchId, @RequestCursor, @ResponseCursor, @ItemJson);
 '@
         [void]$cmd.Parameters.Add('@BatchId', [Data.SqlDbType]::UniqueIdentifier)
-        [void]$cmd.Parameters.Add('@RequestCursor', [Data.SqlDbType]::UniqueIdentifier)
-        [void]$cmd.Parameters.Add('@ResponseCursor', [Data.SqlDbType]::UniqueIdentifier)
+        [void]$cmd.Parameters.Add('@RequestCursor', [Data.SqlDbType]::NVarChar, 400)
+        [void]$cmd.Parameters.Add('@ResponseCursor', [Data.SqlDbType]::NVarChar, 400)
         [void]$cmd.Parameters.Add('@ItemJson', [Data.SqlDbType]::NVarChar, -1)
 
         $duplicateCount = 0
@@ -173,8 +190,8 @@ function Write-CursorLog {
     param(
         [System.Data.SqlClient.SqlConnection] $Connection,
         [guid] $BatchId,
-        [Nullable[guid]] $RequestCursor,
-        [Nullable[guid]] $ResponseCursor,
+        [string] $RequestCursor,
+        [string] $ResponseCursor,
         [int] $ItemCount,
         [int] $HttpStatusCode,
         [string] $ErrorMessage
@@ -182,12 +199,12 @@ function Write-CursorLog {
 
     $cmd = $Connection.CreateCommand()
     $cmd.CommandText = @'
-INSERT INTO dbo.ApiCursorLog (BatchId, RequestCursorGuid, ResponseCursorGuid, ItemCount, HttpStatusCode, ErrorMessage)
+INSERT INTO dbo.ApiCursorLog (BatchId, RequestCursor, ResponseCursor, ItemCount, HttpStatusCode, ErrorMessage)
 VALUES (@BatchId, @RequestCursor, @ResponseCursor, @ItemCount, @HttpStatusCode, @ErrorMessage);
 '@
     [void]$cmd.Parameters.Add('@BatchId', [Data.SqlDbType]::UniqueIdentifier)
-    [void]$cmd.Parameters.Add('@RequestCursor', [Data.SqlDbType]::UniqueIdentifier)
-    [void]$cmd.Parameters.Add('@ResponseCursor', [Data.SqlDbType]::UniqueIdentifier)
+    [void]$cmd.Parameters.Add('@RequestCursor', [Data.SqlDbType]::NVarChar, 400)
+    [void]$cmd.Parameters.Add('@ResponseCursor', [Data.SqlDbType]::NVarChar, 400)
     [void]$cmd.Parameters.Add('@ItemCount', [Data.SqlDbType]::Int)
     [void]$cmd.Parameters.Add('@HttpStatusCode', [Data.SqlDbType]::Int)
     [void]$cmd.Parameters.Add('@ErrorMessage', [Data.SqlDbType]::NVarChar, -1)
@@ -205,13 +222,13 @@ function Get-LastGoodCursor {
     param([System.Data.SqlClient.SqlConnection] $Connection)
     $cmd = $Connection.CreateCommand()
     $cmd.CommandText = @'
-SELECT TOP 1 ResponseCursorGuid
+SELECT TOP 1 ResponseCursor
 FROM dbo.ApiCursorLog
 WHERE ErrorMessage IS NULL
 ORDER BY CalledAtUtc DESC;
 '@
     $result = $cmd.ExecuteScalar()
-    if ($result -and $result -ne [DBNull]::Value) { return [guid]$result }
+    if ($result -and $result -ne [DBNull]::Value) { return [string]$result }
     return $null
 }
 
@@ -242,7 +259,7 @@ try {
             }
 
             $requestBody = $BaseRequestBody.Clone()
-            if ($cursor) { $requestBody[$CursorRequestField] = $cursor.ToString() }
+            if ($cursor) { $requestBody[$CursorRequestField] = $cursor }
 
             $batchId = [guid]::NewGuid()
             $statusCode = $null
@@ -254,9 +271,9 @@ try {
                 $response = Invoke-ApiPage -Uri $ApiUri -Headers $headers -Body $requestBody
                 $statusCode = 200
 
-                $items = @($response.$DataField)
-                $rawNext = $response.$CursorResponseField
-                if ($rawNext) { $nextCursor = [guid]$rawNext }
+                $items = @(Resolve-JsonPath -InputObject $response -Path $DataField)
+                $rawNext = Resolve-JsonPath -InputObject $response -Path $CursorResponseField
+                if ($rawNext) { $nextCursor = [string]$rawNext }
 
                 if ($items.Count -gt 0) {
                     Save-ApiBatch -Connection $sqlConn -BatchId $batchId `
