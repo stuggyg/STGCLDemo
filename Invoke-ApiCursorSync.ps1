@@ -32,6 +32,11 @@ param(
     # Extra fixed fields to send on every request (filters, page size, etc).
     [hashtable] $BaseRequestBody = @{},
 
+    # Fields to drop from BaseRequestBody once a cursor exists, for APIs where
+    # the cursor call continues a search context and re-sending the original
+    # search fields (e.g. 'query') is invalid on follow-up calls.
+    [string[]] $CursorExcludeFields = @(),
+
     # Bypasses ALL TLS certificate validation (expired, self-signed, untrusted
     # chain, hostname mismatch) process-wide for the life of the script. Use
     # only when the on-prem endpoint's cert problem can't be fixed.
@@ -89,6 +94,31 @@ function Get-PlainTextToken {
     }
 }
 
+function Get-HttpErrorDetail {
+    param($ErrorRecord)
+
+    $statusCode = $null
+    $bodyText = $null
+
+    $response = $ErrorRecord.Exception.Response
+    if ($response) {
+        try { $statusCode = [int]$response.StatusCode } catch { }
+        try {
+            $stream = $response.GetResponseStream()
+            if ($stream) {
+                $bodyText = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+            }
+        }
+        catch { }
+    }
+
+    if (-not $bodyText -and $ErrorRecord.ErrorDetails) {
+        $bodyText = $ErrorRecord.ErrorDetails.Message
+    }
+
+    [pscustomobject]@{ StatusCode = $statusCode; Body = $bodyText }
+}
+
 function Invoke-ApiPage {
     param(
         [string] $Uri,
@@ -105,8 +135,19 @@ function Invoke-ApiPage {
                 -ContentType 'application/json' -Body $json
         }
         catch {
-            if ($attempt -ge $RetryCount) { throw }
-            Write-Warning "API call failed (attempt $attempt/$RetryCount): $($_.Exception.Message). Retrying in $RetryDelaySeconds s."
+            $detail = Get-HttpErrorDetail -ErrorRecord $_
+            $message = $_.Exception.Message
+            if ($detail.StatusCode) { $message = "[HTTP $($detail.StatusCode)] $message" }
+            if ($detail.Body) { $message = "$message Response body: $($detail.Body)" }
+
+            # 4xx (other than 429 rate-limiting) means the request itself is
+            # wrong - retrying the same malformed body won't fix that.
+            $isNonRetryableClientError = $detail.StatusCode -ge 400 -and $detail.StatusCode -lt 500 -and $detail.StatusCode -ne 429
+
+            if ($isNonRetryableClientError -or $attempt -ge $RetryCount) {
+                throw $message
+            }
+            Write-Warning "API call failed (attempt $attempt/$RetryCount): $message. Retrying in $RetryDelaySeconds s."
             Start-Sleep -Seconds $RetryDelaySeconds
         }
     }
@@ -259,7 +300,10 @@ try {
             }
 
             $requestBody = $BaseRequestBody.Clone()
-            if ($cursor) { $requestBody[$CursorRequestField] = $cursor }
+            if ($cursor) {
+                foreach ($field in $CursorExcludeFields) { $requestBody.Remove($field) }
+                $requestBody[$CursorRequestField] = $cursor
+            }
 
             $batchId = [guid]::NewGuid()
             $statusCode = $null
