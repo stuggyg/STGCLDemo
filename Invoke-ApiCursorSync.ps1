@@ -46,6 +46,10 @@ param(
     [int] $RetryCount = 3,
     [int] $RetryDelaySeconds = 5,
 
+    # SqlCommand.CommandTimeout in seconds (default ADO.NET timeout is only
+    # 30s, which insert-heavy long runs can outgrow as the table/index grows).
+    [int] $SqlCommandTimeoutSeconds = 120,
+
     # Resume a previous run using the last successfully logged cursor
     # instead of starting from the beginning.
     [switch] $Resume,
@@ -186,6 +190,7 @@ function Save-ApiBatch {
     try {
         $cmd = $Connection.CreateCommand()
         $cmd.Transaction = $tx
+        $cmd.CommandTimeout = $SqlCommandTimeoutSeconds
         $cmd.CommandText = @'
 INSERT INTO dbo.ApiCursorResults (BatchId, RequestCursor, ResponseCursor, ItemJson)
 VALUES (@BatchId, @RequestCursor, @ResponseCursor, @ItemJson);
@@ -239,6 +244,7 @@ function Write-CursorLog {
     )
 
     $cmd = $Connection.CreateCommand()
+    $cmd.CommandTimeout = $SqlCommandTimeoutSeconds
     $cmd.CommandText = @'
 INSERT INTO dbo.ApiCursorLog (BatchId, RequestCursor, ResponseCursor, ItemCount, HttpStatusCode, ErrorMessage)
 VALUES (@BatchId, @RequestCursor, @ResponseCursor, @ItemCount, @HttpStatusCode, @ErrorMessage);
@@ -262,6 +268,7 @@ VALUES (@BatchId, @RequestCursor, @ResponseCursor, @ItemCount, @HttpStatusCode, 
 function Get-LastGoodCursor {
     param([System.Data.SqlClient.SqlConnection] $Connection)
     $cmd = $Connection.CreateCommand()
+    $cmd.CommandTimeout = $SqlCommandTimeoutSeconds
     $cmd.CommandText = @'
 SELECT TOP 1 ResponseCursor
 FROM dbo.ApiCursorLog
