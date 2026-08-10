@@ -289,7 +289,6 @@ try {
             if ($cursor) { Write-Host "Resuming from cursor $cursor" }
         }
 
-        $seenCursors = New-Object 'System.Collections.Generic.HashSet[string]'
         $iteration = 0
 
         do {
@@ -336,14 +335,13 @@ try {
 
             Write-Host "Batch $iteration : cursor=$cursor -> next=$nextCursor, items=$($items.Count)"
 
-            # Stop conditions: no further cursor, no items returned, or the API
-            # handed back a cursor we've already processed (loop guard).
+            # Stop conditions: no cursor came back, or the page was empty. Note
+            # this API reuses the same cursor across calls (it's a stable scroll
+            # ID, not a per-page pointer), so an unchanged cursor is expected
+            # and is NOT treated as a stop signal - only MaxIterations guards
+            # against a truly runaway loop.
             if (-not $nextCursor) { break }
             if ($items.Count -eq 0) { break }
-            if (-not $seenCursors.Add($nextCursor.ToString())) {
-                Write-Warning "Cursor $nextCursor was already processed. Stopping to avoid an infinite loop."
-                break
-            }
 
             $cursor = $nextCursor
         } while ($true)
