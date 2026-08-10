@@ -107,6 +107,27 @@ param(
     [int] $StartPage = 1,
     [int] $MaxPages = 10000,
 
+    # The COMPLETE --data-raw value from the report cURL capture, pasted as one
+    # string, e.g. 'adapcsrf=...&domainName=CORP&reportType=UserLogon&...'.
+    #
+    # Use this when the real console body carries more than the seven fields
+    # named in $Endpoint - column selections, filters, sort order, view/tab ids.
+    # ADAudit Plus may require them, and anything not sent is simply absent from
+    # the request. Paste the capture verbatim: repeated keys and field order are
+    # preserved, and the seven fields this script manages (adapcsrf, domainName,
+    # reportType, startTime, endTime, page, range) are overwritten with live
+    # values afterwards, so stale tokens and dates in the pasted text are inert.
+    #
+    # Leave empty to send only the seven managed fields, which reproduces the
+    # trimmed capture exactly.
+    [string] $RawReportFormData = '',
+
+    # Individual additions or overrides applied on top of -RawReportFormData.
+    # Handy for flipping one field without re-pasting the whole body:
+    #   -ExtraReportFields @{ sortColumn = 'LOGON_TIME'; sortOrder = 'desc' }
+    # Cannot express repeated keys - use -RawReportFormData for those.
+    [hashtable] $ExtraReportFields = @{},
+
     # Top-level JSON array holding the events. Used only for the paging stop
     # test - see contradiction note 4 in the header.
     [string] $DataField = 'reportData',
@@ -309,6 +330,19 @@ function Connect-AdapSession {
         [switch] $PreGetLoginPage
     )
 
+    # The console takes the domain in its own field, so j_username wants the
+    # bare account name. Typing CORP\svc_reader or svc_reader@corp.local at the
+    # Get-Credential prompt is easy muscle memory and produces a 200 serving the
+    # login page again - which trips the cookie assertion with a message that
+    # points at the password rather than the real cause. Warn, don't rewrite:
+    # some deployments may genuinely expect a qualified name.
+    if ($Credential.UserName -match '[\\@]') {
+        Write-Warning ("Username '$($Credential.UserName)' looks domain-qualified. " +
+            "The domain goes in the '$($Endpoint.FieldDomain)' field (-DomainName '$DomainName'), " +
+            "so '$($Endpoint.FieldUsername)' normally wants just the account name. " +
+            "If login fails, retry with the bare username.")
+    }
+
     $session = $null
 
     if ($PreGetLoginPage) {
@@ -384,6 +418,83 @@ function Test-LooksLikeJson {
     return $trimmed.StartsWith('{') -or $trimmed.StartsWith('[')
 }
 
+function ConvertFrom-FormUrlEncoded {
+    <#
+    Parses a cURL --data-raw value into an ORDERED list of name/value pairs.
+
+    Deliberately a list, not a hashtable: real console report bodies repeat keys
+    (columns=A&columns=B&columns=C is the usual way a multi-select is sent), and
+    a hashtable silently keeps only the last one. Order is preserved too, since
+    an undocumented Struts action may care about it.
+    #>
+    param([string] $FormData)
+
+    $pairs = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($FormData)) { return $pairs }
+
+    # Tolerate a leading '?' or a pasted "--data-raw '...'" wrapper's quotes.
+    $text = $FormData.Trim().TrimStart('?').Trim("'", '"')
+
+    foreach ($segment in $text -split '&') {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+
+        # Split on the FIRST '=' only - an unencoded '=' inside a value is
+        # common in base64-ish or JSON-ish field values.
+        $eq = $segment.IndexOf('=')
+        if ($eq -lt 0) {
+            $name = $segment
+            $value = ''
+        }
+        else {
+            $name = $segment.Substring(0, $eq)
+            $value = $segment.Substring($eq + 1)
+        }
+
+        # WebUtility (not Uri.UnescapeDataString) because form encoding uses
+        # '+' for space, which UnescapeDataString would leave as a literal '+'.
+        [void]$pairs.Add([pscustomobject]@{
+            Name  = [System.Net.WebUtility]::UrlDecode($name)
+            Value = [System.Net.WebUtility]::UrlDecode($value)
+        })
+    }
+
+    return $pairs
+}
+
+function Set-FormField {
+    <#
+    Sets a field to a single value, replacing every existing occurrence.
+    Used for the fields this script owns, so a stale value pasted in from a
+    capture (expired adapcsrf, page=1, last month's dates) cannot survive.
+    #>
+    param(
+        [System.Collections.Generic.List[object]] $Pairs,
+        [string] $Name,
+        $Value
+    )
+
+    # -ceq: HTTP form field names are case-sensitive.
+    $existing = @($Pairs | Where-Object { $_.Name -ceq $Name })
+
+    if ($existing.Count -gt 0) {
+        $existing[0].Value = [string]$Value
+        for ($i = 1; $i -lt $existing.Count; $i++) { [void]$Pairs.Remove($existing[$i]) }
+    }
+    else {
+        [void]$Pairs.Add([pscustomobject]@{ Name = $Name; Value = [string]$Value })
+    }
+}
+
+function ConvertTo-FormUrlEncoded {
+    param([System.Collections.Generic.List[object]] $Pairs)
+
+    # EscapeDataString percent-encodes everything outside the unreserved set,
+    # so a literal '+' in a value becomes %2B rather than being read as a space.
+    ($Pairs | ForEach-Object {
+        '{0}={1}' -f [uri]::EscapeDataString($_.Name), [uri]::EscapeDataString([string]$_.Value)
+    }) -join '&'
+}
+
 function Invoke-AdapReportPage {
     <#
     One report POST. CSRF is double-submit: adapcsrf travels as a cookie
@@ -400,14 +511,39 @@ function Invoke-AdapReportPage {
         [int64]  $EndEpochMs
     )
 
-    $body = @{}
-    $body[$Endpoint.FieldCsrf]       = $Csrf
-    $body[$Endpoint.FieldDomain]     = $DomainName
-    $body[$Endpoint.FieldReportType] = $ReportType
-    $body[$Endpoint.FieldStartTime]  = $StartEpochMs
-    $body[$Endpoint.FieldEndTime]    = $EndEpochMs
-    $body[$Endpoint.FieldPage]       = $PageNo
-    $body[$Endpoint.FieldRange]      = $Range
+    # Body is assembled as an ordered pair list and encoded to a string, NOT
+    # passed as a hashtable. Two reasons: real console bodies repeat keys
+    # (columns=A&columns=B), which a hashtable collapses to one; and a hashtable
+    # has no defined ordering, which an undocumented Struts action may care
+    # about. Building the string ourselves keeps the request byte-comparable to
+    # the capture.
+    $pairs = ConvertFrom-FormUrlEncoded -FormData $RawReportFormData
+
+    # Caller-supplied additions/overrides, applied over the pasted capture.
+    foreach ($key in $ExtraReportFields.Keys) {
+        Set-FormField -Pairs $pairs -Name $key -Value $ExtraReportFields[$key]
+    }
+
+    # Fields this script owns are applied LAST and always win, so a stale
+    # adapcsrf, page number or date range pasted in via -RawReportFormData
+    # cannot leak into the live request.
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldCsrf       -Value $Csrf
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldDomain     -Value $DomainName
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldReportType -Value $ReportType
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldStartTime  -Value $StartEpochMs
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldEndTime    -Value $EndEpochMs
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldPage       -Value $PageNo
+    Set-FormField -Pairs $pairs -Name $Endpoint.FieldRange      -Value $Range
+
+    $body = ConvertTo-FormUrlEncoded -Pairs $pairs
+
+    # -Verbose prints the outgoing body with the CSRF token masked, for
+    # diffing against the capture when a call misbehaves.
+    if ($VerbosePreference -ne 'SilentlyContinue') {
+        $masked = ConvertFrom-FormUrlEncoded -FormData $body
+        Set-FormField -Pairs $masked -Name $Endpoint.FieldCsrf -Value '<masked>'
+        Write-Verbose "POST body (page $PageNo): $(ConvertTo-FormUrlEncoded -Pairs $masked)"
+    }
 
     $headers = @{
         'X-Requested-With' = 'XMLHttpRequest'
