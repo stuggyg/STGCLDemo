@@ -136,6 +136,18 @@ param(
     # trimmed capture exactly.
     [string] $RawReportFormData = '',
 
+    # An ENTIRE cURL command for the call the console makes BEFORE the report
+    # data call - observed as getReportInputParams on this build.
+    #
+    # The report screen is a two-step flow: this call primes session-scoped
+    # server state for the report, and the data call is served against it. Skip
+    # it and every report 403s, which looks like an auth or permissions problem
+    # and is not. Paste the capture; nothing about this call is assumed.
+    #
+    # Replayed after login and again after every re-authentication, since a new
+    # session has none of the primed state.
+    [string] $PreReportCurlCommand = '',
+
     # Replay the -H headers from -ReportCurlCommand on every report call,
     # instead of the script's inferred X-Requested-With + Referer pair.
     #
@@ -477,6 +489,58 @@ function Test-LooksLikeJson {
     return $trimmed.StartsWith('{') -or $trimmed.StartsWith('[')
 }
 
+function New-AdapHeaders {
+    <#
+    Builds the header set for a console call, shared by the report call and any
+    prerequisite call so both present identically to the security filter.
+
+    The baseline pair is an INFERENCE from a trimmed capture, not a certainty.
+    ManageEngine's filter sits in front of every request and can reject on
+    header shape alone - a missing Origin, a non-browser User-Agent - surfacing
+    as a 403 that looks nothing like an auth problem. -UseCapturedHeaders
+    replays what the browser actually sent, which is how to rule that out.
+    #>
+    param([hashtable] $CapturedHeaders)
+
+    $headers = @{
+        'X-Requested-With' = 'XMLHttpRequest'
+        'Referer'          = "$BaseUrl/"
+    }
+
+    # Headers PowerShell sets itself, or that must not be replayed from a
+    # capture. Cookie above all: those are dead session tokens and would fight
+    # the live ones carried by -WebSession.
+    $skipHeaders = @(
+        'cookie', 'content-length', 'content-type', 'host', 'accept-encoding',
+        'connection', 'transfer-encoding', 'expect', 'date', 'if-modified-since',
+        'range', 'proxy-connection', 'user-agent'
+    )
+
+    $userAgent = $null
+
+    if ($UseCapturedHeaders -and $CapturedHeaders) {
+        foreach ($name in $CapturedHeaders.Keys) {
+            if ($name.ToLower() -eq 'user-agent') {
+                # Restricted on HttpWebRequest - must go via -UserAgent.
+                $userAgent = $CapturedHeaders[$name]
+                continue
+            }
+            if ($skipHeaders -contains $name.ToLower()) { continue }
+            $headers[$name] = $CapturedHeaders[$name]
+        }
+    }
+
+    foreach ($name in $ExtraHeaders.Keys) {
+        if ($name.ToLower() -eq 'user-agent') {
+            $userAgent = $ExtraHeaders[$name]
+            continue
+        }
+        $headers[$name] = $ExtraHeaders[$name]
+    }
+
+    [pscustomobject]@{ Headers = $headers; UserAgent = $userAgent }
+}
+
 function Save-FailedResponse {
     <#
     Dumps a response that could not be interpreted next to the transcript, so
@@ -542,6 +606,7 @@ function ConvertFrom-CurlCommand {
 
     $url = $null
     $data = $null
+    $method = $null
     $headers = @{}
     $dataFlags = @('--data-raw', '--data-binary', '--data-urlencode', '--data', '-d')
 
@@ -550,6 +615,12 @@ function ConvertFrom-CurlCommand {
 
         if (-not $url -and $token -match '^https?://') {
             $url = $token
+            continue
+        }
+
+        if (($token -eq '-X' -or $token -eq '--request') -and ($i + 1) -lt $tokens.Count) {
+            $method = $tokens[$i + 1]
+            $i++
             continue
         }
 
@@ -575,9 +646,11 @@ function ConvertFrom-CurlCommand {
     if (-not $url) {
         throw 'Could not find an http(s) URL in the pasted cURL command.'
     }
-    if ($null -eq $data) {
-        throw ("Could not find a --data-raw/--data/-d argument in the pasted cURL command. " +
-            'A report call is a POST with a form body; if the capture has no body, it is not the report request.')
+
+    # A body is not required: a prerequisite/priming call may well be a GET.
+    # Callers that DO need one validate for themselves.
+    if (-not $method) {
+        $method = if ($null -ne $data) { 'POST' } else { 'GET' }
     }
 
     $uri = [uri]$url
@@ -585,6 +658,8 @@ function ConvertFrom-CurlCommand {
     [pscustomobject]@{
         BaseUrl = '{0}://{1}' -f $uri.Scheme, $uri.Authority
         Path    = $uri.AbsolutePath
+        Query   = $uri.Query
+        Method  = $method.ToUpper()
         Data    = $data
         Headers = $headers
     }
@@ -723,47 +798,9 @@ function Invoke-AdapReportPage {
         Write-Verbose "POST body (page $PageNo): $(ConvertTo-FormUrlEncoded -Pairs $masked)"
     }
 
-    # Baseline headers are an INFERENCE from the capture, not a certainty - the
-    # capture supplied to me was trimmed. ManageEngine's security filter sits in
-    # front of every request and can reject on header shape alone (missing
-    # Origin, a non-browser User-Agent), which surfaces as a 403 that looks
-    # nothing like an auth problem. -UseCapturedHeaders replays what the browser
-    # actually sent, which is the way to rule that out.
-    $headers = @{
-        'X-Requested-With' = 'XMLHttpRequest'
-        'Referer'          = "$BaseUrl/"
-    }
-
-    # Headers PowerShell sets itself or that must not be replayed from a
-    # capture. Cookie above all: those are dead session tokens, and sending
-    # them would fight the live ones in -WebSession.
-    $skipHeaders = @(
-        'cookie', 'content-length', 'content-type', 'host', 'accept-encoding',
-        'connection', 'transfer-encoding', 'expect', 'date', 'if-modified-since',
-        'range', 'proxy-connection', 'user-agent'
-    )
-
-    $userAgent = $null
-
-    if ($UseCapturedHeaders -and $script:CapturedHeaders) {
-        foreach ($name in $script:CapturedHeaders.Keys) {
-            if ($name.ToLower() -eq 'user-agent') {
-                # Restricted on HttpWebRequest - has to go via -UserAgent.
-                $userAgent = $script:CapturedHeaders[$name]
-                continue
-            }
-            if ($skipHeaders -contains $name.ToLower()) { continue }
-            $headers[$name] = $script:CapturedHeaders[$name]
-        }
-    }
-
-    foreach ($name in $ExtraHeaders.Keys) {
-        if ($name.ToLower() -eq 'user-agent') {
-            $userAgent = $ExtraHeaders[$name]
-            continue
-        }
-        $headers[$name] = $ExtraHeaders[$name]
-    }
+    $headerSet = New-AdapHeaders -CapturedHeaders $script:CapturedHeaders
+    $headers = $headerSet.Headers
+    $userAgent = $headerSet.UserAgent
 
     $uri = "$BaseUrl$($Endpoint.ReportPath)"
 
@@ -835,6 +872,89 @@ function Invoke-AdapReportPage {
     }
 }
 
+function Invoke-AdapPrerequisiteCall {
+    <#
+    Replays a captured call that the console makes BEFORE the report data call -
+    e.g. getReportInputParams. Nothing about it is guessed: the path, method,
+    body and headers all come from the pasted capture.
+
+    Why it matters: the console's report screen is a two-step flow. The first
+    call primes server-side, session-scoped state for the report; the data call
+    is then served against that state. Skipping it makes every report 403,
+    because the filter rejects a data call for a report the session never set
+    up - which reads exactly like an auth or permissions failure and is not.
+
+    Consequently this must run again after every re-authentication: a new
+    session has none of the primed state.
+
+    Returns the response body so it can be inspected. If the priming response
+    turns out to carry values the data call needs (a handle, a config id, a
+    rotated token), those are NOT wired through yet - that needs a capture of
+    the response to do correctly.
+    #>
+    param(
+        [Microsoft.PowerShell.Commands.WebRequestSession] $Session,
+        [string] $Csrf
+    )
+
+    if (-not $script:PreReportCall) { return $null }
+
+    $call = $script:PreReportCall
+    $uri = "$BaseUrl$($call.Path)$($call.Query)"
+
+    $headerSet = New-AdapHeaders -CapturedHeaders $call.Headers
+    $requestArgs = @{
+        Uri             = $uri
+        Method          = $call.Method
+        Headers         = $headerSet.Headers
+        WebSession      = $Session
+        UseBasicParsing = $true
+        TimeoutSec      = $HttpTimeoutSeconds
+    }
+    if ($headerSet.UserAgent) { $requestArgs['UserAgent'] = $headerSet.UserAgent }
+
+    if ($null -ne $call.Data) {
+        # Only the CSRF field is refreshed - everything else is sent exactly as
+        # captured, because which fields matter here is unknown.
+        $pairs = ConvertFrom-FormUrlEncoded -FormData $call.Data
+        $existingCsrf = @($pairs | Where-Object { $_.Name -ceq $Endpoint.FieldCsrf })
+        if ($existingCsrf.Count -gt 0) {
+            Set-FormField -Pairs $pairs -Name $Endpoint.FieldCsrf -Value $Csrf
+        }
+
+        $requestArgs['Body'] = ConvertTo-FormUrlEncoded -Pairs $pairs
+        $requestArgs['ContentType'] = $FormContentType
+
+        if ($VerbosePreference -ne 'SilentlyContinue') {
+            $masked = ConvertFrom-FormUrlEncoded -FormData $requestArgs['Body']
+            if (@($masked | Where-Object { $_.Name -ceq $Endpoint.FieldCsrf }).Count -gt 0) {
+                Set-FormField -Pairs $masked -Name $Endpoint.FieldCsrf -Value '<masked>'
+            }
+            Write-Verbose "Prerequisite $($call.Method) body: $(ConvertTo-FormUrlEncoded -Pairs $masked)"
+        }
+    }
+
+    Write-Verbose "Prerequisite call: $($call.Method) $uri"
+
+    try {
+        $response = Invoke-WebRequest @requestArgs
+        Write-Verbose "Prerequisite call returned HTTP $([int]$response.StatusCode), $($response.Content.Length) chars."
+        return $response.Content
+    }
+    catch {
+        $detail = Get-HttpErrorDetail -ErrorRecord $_
+        $dumpPath = $null
+        if ($detail.Body) { $dumpPath = Save-FailedResponse -Content $detail.Body -PageNo 0 }
+
+        $message = "Prerequisite call failed: $($call.Method) $uri"
+        if ($detail.StatusCode) { $message = "$message [HTTP $($detail.StatusCode)]" }
+        $message = "$message - $($_.Exception.Message)"
+        if ($dumpPath) { $message = "$message (response body: $dumpPath)" }
+
+        throw $message
+    }
+}
+
 function Get-AdapReportPage {
     <#
     Wraps Invoke-AdapReportPage with session-expiry recovery. On a long pull the
@@ -859,6 +979,10 @@ function Get-AdapReportPage {
     $script:AdapSession = Connect-AdapSession -BaseUrl $BaseUrl -Credential $Credential `
         -DomainName $DomainName -PreGetLoginPage:$PreGetLoginPage
     $script:AdapCsrf = Assert-AdapSession -Session $script:AdapSession -BaseUrl $BaseUrl
+
+    # The new session has none of the report state the previous one was primed
+    # with, so the priming call has to be replayed before the data call.
+    [void](Invoke-AdapPrerequisiteCall -Session $script:AdapSession -Csrf $script:AdapCsrf)
 
     $result = Invoke-AdapReportPage -Session $script:AdapSession -BaseUrl $BaseUrl `
         -Csrf $script:AdapCsrf -PageNo $PageNo -StartEpochMs $StartEpochMs -EndEpochMs $EndEpochMs
@@ -1004,6 +1128,14 @@ try {
         }
         $Endpoint.ReportPath = $parsedCurl.Path
 
+        # The parser allows a body-less command (a prerequisite call may be a
+        # GET), so the report command has to insist on one itself.
+        if ($null -eq $parsedCurl.Data -and -not $RawReportFormData) {
+            throw ('The cURL passed to -ReportCurlCommand has no --data-raw/--data/-d argument. ' +
+                'The report call is a POST with a form body - this looks like a different request. ' +
+                'If it is the prerequisite call, pass it as -PreReportCurlCommand instead.')
+        }
+
         # -RawReportFormData is the more specific input, so it wins if both given.
         if (-not $RawReportFormData) {
             $RawReportFormData = $parsedCurl.Data
@@ -1022,6 +1154,20 @@ try {
     }
     elseif ($UseCapturedHeaders) {
         Write-Warning '-UseCapturedHeaders has no effect without -ReportCurlCommand to take headers from.'
+    }
+
+    $script:PreReportCall = $null
+    if ($PreReportCurlCommand) {
+        $script:PreReportCall = ConvertFrom-CurlCommand -CurlCommand $PreReportCurlCommand
+        Write-Verbose ("Prerequisite call parsed: $($script:PreReportCall.Method) " +
+            "$($script:PreReportCall.Path)$($script:PreReportCall.Query), " +
+            "$(if ($script:PreReportCall.Data) { $script:PreReportCall.Data.Length } else { 0 }) body chars, " +
+            "$($script:PreReportCall.Headers.Count) header(s).")
+
+        if ($script:PreReportCall.BaseUrl -ne $BaseUrl) {
+            Write-Warning ("Prerequisite cURL targets '$($script:PreReportCall.BaseUrl)' but the run uses " +
+                "'$BaseUrl'. The prerequisite call will be sent to '$BaseUrl'.")
+        }
     }
 
     # Resolve the report window. Explicit epoch values win, so a capture can be
@@ -1081,6 +1227,11 @@ try {
             -DomainName $DomainName -PreGetLoginPage:$PreGetLoginPage
         $script:AdapCsrf = Assert-AdapSession -Session $script:AdapSession -BaseUrl $BaseUrl
         Write-Host "Session established. Run id: $runId"
+
+        if ($script:PreReportCall) {
+            Write-Host "Replaying prerequisite call: $($script:PreReportCall.Method) $($script:PreReportCall.Path)"
+            [void](Invoke-AdapPrerequisiteCall -Session $script:AdapSession -Csrf $script:AdapCsrf)
+        }
 
         $pageNo = $firstPage
         $pagesLanded = 0
