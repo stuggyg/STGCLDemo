@@ -454,8 +454,37 @@ function Assert-AdapSession {
 function Test-LooksLikeJson {
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-    $trimmed = $Text.TrimStart()
+
+    # U+FEFF (BOM) is NOT whitespace to .NET, so TrimStart() leaves it in place
+    # and a perfectly good JSON body reads as "not JSON". Java servlet stacks
+    # emit one often enough that this is worth stripping explicitly.
+    $trimmed = $Text.TrimStart([char]0xFEFF, [char]0x200B).TrimStart()
+
     return $trimmed.StartsWith('{') -or $trimmed.StartsWith('[')
+}
+
+function Save-FailedResponse {
+    <#
+    Dumps a response that could not be interpreted next to the transcript, so
+    the whole body can be read rather than a 500-char console preview. These
+    endpoints are undocumented; the body IS the documentation when something
+    changes.
+    #>
+    param(
+        [string] $Content,
+        [int]    $PageNo
+    )
+
+    try {
+        $dir = Split-Path $LogPath -Parent
+        $file = Join-Path $dir ("AdapFailedResponse_page{0}_{1}.txt" -f $PageNo, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        Set-Content -Path $file -Value $Content -Encoding UTF8
+        return $file
+    }
+    catch {
+        Write-Warning "Could not write the failed response to disk: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function ConvertFrom-CurlCommand {
@@ -682,7 +711,22 @@ function Invoke-AdapReportPage {
             $response = Invoke-WebRequest -Uri $uri -Method Post -Body $body -Headers $headers `
                 -ContentType $FormContentType -WebSession $Session `
                 -UseBasicParsing -TimeoutSec $HttpTimeoutSeconds
-            return $response.Content
+
+            # Content-Type and the landed URI are carried alongside the body:
+            # when a response is not JSON, those two say why far faster than
+            # reading the body does (text/html = an error or login page; a URI
+            # under a different path = a redirect somewhere unexpected).
+            $responseContentType = $null
+            try { $responseContentType = $response.Headers['Content-Type'] } catch { }
+            $responseUri = $null
+            try { $responseUri = $response.BaseResponse.ResponseUri.AbsoluteUri } catch { }
+
+            return [pscustomobject]@{
+                Content     = $response.Content
+                ContentType = $responseContentType
+                StatusCode  = [int]$response.StatusCode
+                ResponseUri = $responseUri
+            }
         }
         catch {
             $detail = Get-HttpErrorDetail -ErrorRecord $_
@@ -716,27 +760,48 @@ function Get-AdapReportPage {
         [int64] $EndEpochMs
     )
 
-    $content = Invoke-AdapReportPage -Session $script:AdapSession -BaseUrl $BaseUrl `
+    $result = Invoke-AdapReportPage -Session $script:AdapSession -BaseUrl $BaseUrl `
         -Csrf $script:AdapCsrf -PageNo $PageNo -StartEpochMs $StartEpochMs -EndEpochMs $EndEpochMs
 
-    if (Test-LooksLikeJson -Text $content) { return $content }
+    if (Test-LooksLikeJson -Text $result.Content) { return $result.Content }
 
-    Write-Warning "Page $PageNo returned a non-JSON body (session likely expired). Re-authenticating and retrying."
+    Write-Warning ("Page $PageNo returned a non-JSON body (HTTP $($result.StatusCode), " +
+        "Content-Type '$($result.ContentType)'). Re-authenticating and retrying.")
 
     $script:AdapSession = Connect-AdapSession -BaseUrl $BaseUrl -Credential $Credential `
         -DomainName $DomainName -PreGetLoginPage:$PreGetLoginPage
     $script:AdapCsrf = Assert-AdapSession -Session $script:AdapSession -BaseUrl $BaseUrl
 
-    $content = Invoke-AdapReportPage -Session $script:AdapSession -BaseUrl $BaseUrl `
+    $result = Invoke-AdapReportPage -Session $script:AdapSession -BaseUrl $BaseUrl `
         -Csrf $script:AdapCsrf -PageNo $PageNo -StartEpochMs $StartEpochMs -EndEpochMs $EndEpochMs
 
-    if (-not (Test-LooksLikeJson -Text $content)) {
-        $preview = $content
-        if ($preview.Length -gt 500) { $preview = $preview.Substring(0, 500) + '...' }
-        throw "Page $PageNo still returned a non-JSON body after re-authenticating. First 500 chars: $preview"
+    if (-not (Test-LooksLikeJson -Text $result.Content)) {
+        # A fresh login did not fix it, so this is NOT session expiry. The
+        # likely causes, in rough order: the report path or a field name changed
+        # (product upgrade), a required field is missing from the body, or the
+        # console is returning an HTML error page for the request as sent.
+        $dumpPath = Save-FailedResponse -Content $result.Content -PageNo $PageNo
+
+        $preview = $result.Content
+        if ($null -eq $preview) { $preview = '(empty response)' }
+        elseif ($preview.Length -gt 500) { $preview = $preview.Substring(0, 500) + '...' }
+
+        $lines = @(
+            "Page $PageNo returned a non-JSON body even after re-authenticating, so this is not session expiry."
+            "  HTTP status:  $($result.StatusCode)"
+            "  Content-Type: $($result.ContentType)"
+            "  Landed at:    $($result.ResponseUri)"
+            "  Requested:    $BaseUrl$($Endpoint.ReportPath)"
+            "  Body length:  $(if ($result.Content) { $result.Content.Length } else { 0 }) chars"
+        )
+        if ($dumpPath) { $lines += "  Full response written to: $dumpPath" }
+        $lines += "  First 500 chars: $preview"
+        $lines += "Check: does the report path still exist on this build, and does the POST body carry every field the console sends? Re-capture and compare with -Verbose."
+
+        throw ($lines -join [Environment]::NewLine)
     }
 
-    return $content
+    return $result.Content
 }
 
 function Measure-ReportPage {
