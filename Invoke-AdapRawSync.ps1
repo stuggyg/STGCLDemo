@@ -136,6 +136,20 @@ param(
     # trimmed capture exactly.
     [string] $RawReportFormData = '',
 
+    # Replay the -H headers from -ReportCurlCommand on every report call,
+    # instead of the script's inferred X-Requested-With + Referer pair.
+    #
+    # Reach for this on a 403. The security filter every request passes through
+    # can reject on header shape alone - a missing Origin, a non-browser
+    # User-Agent - and the captured headers are ground truth for what this build
+    # accepts. Cookie is never replayed (dead tokens), nor are headers
+    # PowerShell must set itself.
+    [switch] $UseCapturedHeaders,
+
+    # Individual header additions or overrides, applied last.
+    #   -ExtraHeaders @{ Origin = 'https://adaudit.corp.local:8444' }
+    [hashtable] $ExtraHeaders = @{},
+
     # Individual additions or overrides applied on top of -RawReportFormData.
     # Handy for flipping one field without re-pasting the whole body:
     #   -ExtraReportFields @{ sortColumn = 'LOGON_TIME'; sortOrder = 'desc' }
@@ -528,6 +542,7 @@ function ConvertFrom-CurlCommand {
 
     $url = $null
     $data = $null
+    $headers = @{}
     $dataFlags = @('--data-raw', '--data-binary', '--data-urlencode', '--data', '-d')
 
     for ($i = 0; $i -lt $tokens.Count; $i++) {
@@ -535,6 +550,16 @@ function ConvertFrom-CurlCommand {
 
         if (-not $url -and $token -match '^https?://') {
             $url = $token
+            continue
+        }
+
+        if (($token -eq '-H' -or $token -eq '--header') -and ($i + 1) -lt $tokens.Count) {
+            $headerText = $tokens[$i + 1]
+            $i++
+            $colon = $headerText.IndexOf(':')
+            if ($colon -gt 0) {
+                $headers[$headerText.Substring(0, $colon).Trim()] = $headerText.Substring($colon + 1).Trim()
+            }
             continue
         }
 
@@ -561,6 +586,7 @@ function ConvertFrom-CurlCommand {
         BaseUrl = '{0}://{1}' -f $uri.Scheme, $uri.Authority
         Path    = $uri.AbsolutePath
         Data    = $data
+        Headers = $headers
     }
 }
 
@@ -697,9 +723,46 @@ function Invoke-AdapReportPage {
         Write-Verbose "POST body (page $PageNo): $(ConvertTo-FormUrlEncoded -Pairs $masked)"
     }
 
+    # Baseline headers are an INFERENCE from the capture, not a certainty - the
+    # capture supplied to me was trimmed. ManageEngine's security filter sits in
+    # front of every request and can reject on header shape alone (missing
+    # Origin, a non-browser User-Agent), which surfaces as a 403 that looks
+    # nothing like an auth problem. -UseCapturedHeaders replays what the browser
+    # actually sent, which is the way to rule that out.
     $headers = @{
         'X-Requested-With' = 'XMLHttpRequest'
         'Referer'          = "$BaseUrl/"
+    }
+
+    # Headers PowerShell sets itself or that must not be replayed from a
+    # capture. Cookie above all: those are dead session tokens, and sending
+    # them would fight the live ones in -WebSession.
+    $skipHeaders = @(
+        'cookie', 'content-length', 'content-type', 'host', 'accept-encoding',
+        'connection', 'transfer-encoding', 'expect', 'date', 'if-modified-since',
+        'range', 'proxy-connection', 'user-agent'
+    )
+
+    $userAgent = $null
+
+    if ($UseCapturedHeaders -and $script:CapturedHeaders) {
+        foreach ($name in $script:CapturedHeaders.Keys) {
+            if ($name.ToLower() -eq 'user-agent') {
+                # Restricted on HttpWebRequest - has to go via -UserAgent.
+                $userAgent = $script:CapturedHeaders[$name]
+                continue
+            }
+            if ($skipHeaders -contains $name.ToLower()) { continue }
+            $headers[$name] = $script:CapturedHeaders[$name]
+        }
+    }
+
+    foreach ($name in $ExtraHeaders.Keys) {
+        if ($name.ToLower() -eq 'user-agent') {
+            $userAgent = $ExtraHeaders[$name]
+            continue
+        }
+        $headers[$name] = $ExtraHeaders[$name]
     }
 
     $uri = "$BaseUrl$($Endpoint.ReportPath)"
@@ -708,9 +771,19 @@ function Invoke-AdapReportPage {
     while ($true) {
         $attempt++
         try {
-            $response = Invoke-WebRequest -Uri $uri -Method Post -Body $body -Headers $headers `
-                -ContentType $FormContentType -WebSession $Session `
-                -UseBasicParsing -TimeoutSec $HttpTimeoutSeconds
+            $requestArgs = @{
+                Uri             = $uri
+                Method          = 'Post'
+                Body            = $body
+                Headers         = $headers
+                ContentType     = $FormContentType
+                WebSession      = $Session
+                UseBasicParsing = $true
+                TimeoutSec      = $HttpTimeoutSeconds
+            }
+            if ($userAgent) { $requestArgs['UserAgent'] = $userAgent }
+
+            $response = Invoke-WebRequest @requestArgs
 
             # Content-Type and the landed URI are carried alongside the body:
             # when a response is not JSON, those two say why far faster than
@@ -732,7 +805,22 @@ function Invoke-AdapReportPage {
             $detail = Get-HttpErrorDetail -ErrorRecord $_
             $message = $_.Exception.Message
             if ($detail.StatusCode) { $message = "[HTTP $($detail.StatusCode)] $message" }
-            if ($detail.Body) { $message = "$message Response body: $($detail.Body)" }
+            if ($detail.Body) {
+                # The error body is the only documentation these endpoints have.
+                # Dump it whole rather than truncating it into the message.
+                $dumpPath = Save-FailedResponse -Content $detail.Body -PageNo $PageNo
+                $bodyPreview = $detail.Body
+                if ($bodyPreview.Length -gt 500) { $bodyPreview = $bodyPreview.Substring(0, 500) + '...' }
+                $message = "$message Requested: $uri. Response body: $bodyPreview"
+                if ($dumpPath) { $message = "$message (full body: $dumpPath)" }
+            }
+
+            if ($detail.StatusCode -eq 403) {
+                $message = ("$message`nA 403 here is usually one of: the report path does not exist on this " +
+                    "build (this console answers unknown paths with 403, not 404); the security filter is " +
+                    "rejecting the request shape (try -UseCapturedHeaders to replay the browser's headers); " +
+                    "a stale or missing CSRF field; or the account lacks rights to this report.")
+            }
 
             # 4xx other than 429 means the request itself is wrong - a bad CSRF
             # token, a renamed field, an expired session. Retrying an identical
@@ -924,7 +1012,16 @@ try {
             Write-Warning 'Both -ReportCurlCommand and -RawReportFormData given; using -RawReportFormData for the body.'
         }
 
-        Write-Verbose "From pasted cURL: base '$BaseUrl', path '$($Endpoint.ReportPath)', body $($RawReportFormData.Length) chars."
+        $script:CapturedHeaders = $parsedCurl.Headers
+
+        Write-Verbose "From pasted cURL: base '$BaseUrl', path '$($Endpoint.ReportPath)', body $($RawReportFormData.Length) chars, $($parsedCurl.Headers.Count) header(s)."
+
+        if ($UseCapturedHeaders -and $parsedCurl.Headers.Count -eq 0) {
+            Write-Warning '-UseCapturedHeaders was given but the pasted cURL contained no -H headers.'
+        }
+    }
+    elseif ($UseCapturedHeaders) {
+        Write-Warning '-UseCapturedHeaders has no effect without -ReportCurlCommand to take headers from.'
     }
 
     # Resolve the report window. Explicit epoch values win, so a capture can be
