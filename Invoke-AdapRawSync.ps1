@@ -22,7 +22,7 @@ WHERE THE CAPTURES CONTRADICTED THE WRITTEN BRIEF (captures win, per instruction
 
   1. Login field names. The brief specified "username, password, domain - three
      fields only". The capture shows 'j_username', 'j_password', 'domainName'.
-     Using the capture's names. (j_username/j_password are the standard Java
+     Using the capture's names. (j_username/j_password are the stafvzndard Java
      container form-login names, consistent with a Tomcat/Struts app, so the
      capture is very likely right.)
 
@@ -107,8 +107,22 @@ param(
     [int] $StartPage = 1,
     [int] $MaxPages = 10000,
 
+    # An ENTIRE report cURL command, pasted verbatim from devtools' "Copy as
+    # cURL" - including the curl keyword, URL, -H headers and -b cookies.
+    #
+    # The URL supplies -BaseUrl (unless you pass -BaseUrl explicitly) and the
+    # report path, and the --data-raw argument supplies the form body. Headers
+    # and cookies are ignored: the script sets its own headers, and captured
+    # cookies are dead session tokens that must never be replayed.
+    #
+    # This is the fastest way to re-point the script after a product upgrade -
+    # re-capture in the browser, paste the whole thing, run with -TestSinglePage.
+    [string] $ReportCurlCommand = '',
+
     # The COMPLETE --data-raw value from the report cURL capture, pasted as one
     # string, e.g. 'adapcsrf=...&domainName=CORP&reportType=UserLogon&...'.
+    # Use this INSTEAD of -ReportCurlCommand when you only have the body.
+    # If both are given, this one wins.
     #
     # Use this when the real console body carries more than the seven fields
     # named in $Endpoint - column selections, filters, sort order, view/tab ids.
@@ -319,9 +333,19 @@ function Get-SessionCookieValue {
 function Connect-AdapSession {
     <#
     Posts credentials to the login path and returns the populated
-    WebRequestSession. j_security_check answers 302; the redirect is followed
-    (5.1's default) and the redirect target is what sets the adapcsrf cookie -
-    so no separate call is needed to obtain the CSRF token.
+    WebRequestSession. j_security_check answers with a redirect - 302 on the
+    build originally captured, 303 on a later one. Either is followed
+    automatically (5.1 default -MaximumRedirection 5) and .NET issues the
+    follow-up as a GET in both cases, so the change is behaviourally inert
+    here. The redirect TARGET is what sets the adapcsrf cookie, so no separate
+    call is needed to obtain the CSRF token.
+
+    Because the redirect is followed, the status observed below is the FINAL
+    one (normally 200), not the 302/303. To see the redirect itself:
+        Invoke-WebRequest -Uri "$BaseUrl/j_security_check" -Method Post `
+            -Body @{...} -MaximumRedirection 0 -UseBasicParsing
+    which throws in 5.1 but exposes the status and Location on the exception's
+    Response - see contradiction note 3.
     #>
     param(
         [string] $BaseUrl,
@@ -365,14 +389,30 @@ function Connect-AdapSession {
     $loginUri = "$BaseUrl$($Endpoint.LoginPath)"
 
     if ($session) {
-        Invoke-WebRequest -Uri $loginUri -Method Post -Body $body -Headers $headers `
+        $loginResponse = Invoke-WebRequest -Uri $loginUri -Method Post -Body $body -Headers $headers `
             -ContentType $FormContentType -WebSession $session `
-            -UseBasicParsing -TimeoutSec $HttpTimeoutSeconds | Out-Null
+            -UseBasicParsing -TimeoutSec $HttpTimeoutSeconds
     }
     else {
-        Invoke-WebRequest -Uri $loginUri -Method Post -Body $body -Headers $headers `
+        $loginResponse = Invoke-WebRequest -Uri $loginUri -Method Post -Body $body -Headers $headers `
             -ContentType $FormContentType -SessionVariable session `
-            -UseBasicParsing -TimeoutSec $HttpTimeoutSeconds | Out-Null
+            -UseBasicParsing -TimeoutSec $HttpTimeoutSeconds
+    }
+
+    # Where the redirect chain actually ended. Worth logging because the whole
+    # login flow depends on it: adapcsrf is set by the redirect TARGET, and
+    # GetCookies() looks the cookie up by $BaseUrl - so if an upgrade ever
+    # redirects to a different host, port or scheme, the cookie lands under a
+    # domain the assertion doesn't check and login "fails" for a reason that is
+    # otherwise invisible. Also flags a bounce straight back to a login page.
+    $finalUri = $null
+    try { $finalUri = $loginResponse.BaseResponse.ResponseUri.AbsoluteUri } catch { }
+    Write-Verbose "Login POST to $loginUri ended at $finalUri (final status $($loginResponse.StatusCode) after any redirects)."
+
+    if ($finalUri -and $finalUri -notlike "$BaseUrl*") {
+        Write-Warning ("Login redirect ended on '$finalUri', outside -BaseUrl '$BaseUrl'. " +
+            "Cookies set there will not be found by the session check. " +
+            "If login fails, set -BaseUrl to match where the console actually redirects.")
     }
 
     return $session
@@ -418,6 +458,83 @@ function Test-LooksLikeJson {
     return $trimmed.StartsWith('{') -or $trimmed.StartsWith('[')
 }
 
+function ConvertFrom-CurlCommand {
+    <#
+    Extracts the URL and the request body from a complete cURL command pasted
+    verbatim - the "Copy as cURL" output from browser devtools.
+
+    This exists because re-capturing IS the maintenance procedure for this
+    script: there are no docs, so every product upgrade is diagnosed by grabbing
+    a fresh capture. Making the whole command pasteable removes the hand-editing
+    step, which is where transcription mistakes creep in.
+
+    Headers and cookies in the pasted command are IGNORED by design. The script
+    sets its own headers, and the captured cookies are dead session tokens that
+    must never be reused - live ones come from logging in.
+
+    Known limitation: bash's '\'' idiom for a literal single quote inside a
+    single-quoted argument is not reassembled. Rare in these bodies; if a value
+    contains an apostrophe, pass the body via -RawReportFormData instead.
+    #>
+    param([string] $CurlCommand)
+
+    # Join line continuations: '\' (bash), '^' (cmd), '`' (PowerShell).
+    $text = $CurlCommand -replace '[\\^`]\s*\r?\n', ' '
+    $text = $text -replace '\r?\n', ' '
+
+    # Tokenize honouring single quotes, double quotes and bare words.
+    $pattern = '''([^'']*)''|"((?:[^"\\]|\\.)*)"|(\S+)'
+    $tokens = New-Object System.Collections.Generic.List[string]
+    foreach ($m in [regex]::Matches($text, $pattern)) {
+        if ($m.Groups[1].Success) {
+            [void]$tokens.Add($m.Groups[1].Value)
+        }
+        elseif ($m.Groups[2].Success) {
+            [void]$tokens.Add(($m.Groups[2].Value -replace '\\(.)', '$1'))
+        }
+        else {
+            [void]$tokens.Add($m.Groups[3].Value)
+        }
+    }
+
+    $url = $null
+    $data = $null
+    $dataFlags = @('--data-raw', '--data-binary', '--data-urlencode', '--data', '-d')
+
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $token = $tokens[$i]
+
+        if (-not $url -and $token -match '^https?://') {
+            $url = $token
+            continue
+        }
+
+        if ($dataFlags -contains $token -and ($i + 1) -lt $tokens.Count) {
+            # Last data flag wins, matching how cURL itself would behave for
+            # a single body (repeated -d would concatenate, which these
+            # captures do not do).
+            $data = $tokens[$i + 1]
+            $i++
+        }
+    }
+
+    if (-not $url) {
+        throw 'Could not find an http(s) URL in the pasted cURL command.'
+    }
+    if ($null -eq $data) {
+        throw ("Could not find a --data-raw/--data/-d argument in the pasted cURL command. " +
+            'A report call is a POST with a form body; if the capture has no body, it is not the report request.')
+    }
+
+    $uri = [uri]$url
+
+    [pscustomobject]@{
+        BaseUrl = '{0}://{1}' -f $uri.Scheme, $uri.Authority
+        Path    = $uri.AbsolutePath
+        Data    = $data
+    }
+}
+
 function ConvertFrom-FormUrlEncoded {
     <#
     Parses a cURL --data-raw value into an ORDERED list of name/value pairs.
@@ -432,8 +549,14 @@ function ConvertFrom-FormUrlEncoded {
     $pairs = New-Object System.Collections.Generic.List[object]
     if ([string]::IsNullOrWhiteSpace($FormData)) { return $pairs }
 
-    # Tolerate a leading '?' or a pasted "--data-raw '...'" wrapper's quotes.
-    $text = $FormData.Trim().TrimStart('?').Trim("'", '"')
+    # Tolerate the whole cURL argument being pasted, not just its value:
+    # "--data-raw 'a=1&b=2'" is stripped down to "a=1&b=2". Without this, the
+    # flag becomes part of the first field NAME and the request silently goes
+    # out malformed - the server answers, just not with the expected data.
+    # Also tolerates a leading '?' and surrounding quotes.
+    $text = $FormData.Trim()
+    $text = $text -replace "^(--data-raw|--data-binary|--data-urlencode|--data|-d)\s+", ''
+    $text = $text.Trim().Trim("'", '"').TrimStart('?').Trim()
 
     foreach ($segment in $text -split '&') {
         if ([string]::IsNullOrWhiteSpace($segment)) { continue }
@@ -707,6 +830,38 @@ function Get-LastLandedPage {
 
 $sqlConn = $null
 try {
+    # A pasted cURL command supplies the endpoint and body. Done before anything
+    # else so the rest of the run uses the captured values.
+    if ($ReportCurlCommand) {
+        $parsedCurl = ConvertFrom-CurlCommand -CurlCommand $ReportCurlCommand
+
+        # An explicit -BaseUrl wins - the capture may name a hostname that only
+        # resolves from the workstation the capture was taken on.
+        if (-not $PSBoundParameters.ContainsKey('BaseUrl')) {
+            $BaseUrl = $parsedCurl.BaseUrl
+        }
+        elseif ($BaseUrl -ne $parsedCurl.BaseUrl) {
+            Write-Warning "Pasted cURL targets '$($parsedCurl.BaseUrl)' but -BaseUrl says '$BaseUrl'. Using -BaseUrl."
+        }
+
+        if ($parsedCurl.Path -ne $Endpoint.ReportPath) {
+            Write-Warning ("Pasted cURL uses report path '$($parsedCurl.Path)', not the built-in " +
+                "'$($Endpoint.ReportPath)'. Using the pasted one - if this is a product upgrade, " +
+                'update the $Endpoint block so the default matches.')
+        }
+        $Endpoint.ReportPath = $parsedCurl.Path
+
+        # -RawReportFormData is the more specific input, so it wins if both given.
+        if (-not $RawReportFormData) {
+            $RawReportFormData = $parsedCurl.Data
+        }
+        else {
+            Write-Warning 'Both -ReportCurlCommand and -RawReportFormData given; using -RawReportFormData for the body.'
+        }
+
+        Write-Verbose "From pasted cURL: base '$BaseUrl', path '$($Endpoint.ReportPath)', body $($RawReportFormData.Length) chars."
+    }
+
     # Resolve the report window. Explicit epoch values win, so a capture can be
     # replayed byte-for-byte while verifying the endpoint.
     if ($StartTimeEpochMs -gt 0) {
